@@ -31,12 +31,105 @@ from candl.lib import *
 import candl.io
 import candl.transformations.abstract_base
 import os
+from pathlib import Path
 
 # --------------------------------------#
 # GRAB DIRECTORY
 # --------------------------------------#
 
 candl_path = os.path.dirname(os.path.realpath(__file__))
+
+
+def _resolve_data_set_file(data_set_path, file_path):
+    file_path = Path(file_path)
+    if file_path.is_absolute() and file_path.is_file():
+        return file_path
+    if str(file_path).startswith(os.sep):
+        return Path(str(data_set_path) + str(file_path))
+    return Path(data_set_path) / file_path
+
+
+def _load_python_module_from_file(module_path):
+    """Load and return a Python module from a file path."""
+    module_path = Path(module_path)
+    if not module_path.is_file():
+        raise FileNotFoundError(f"Could not find prior source file: {module_path}")
+
+    module_name = (
+        f"candl_prior_source_{module_path.stem}_"
+        f"{abs(hash(str(module_path.resolve())))}"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, str(module_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not import prior source file: {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _prepare_prior_args(prior_block, data_set_path):
+    """Prepare prior keyword arguments from a YAML prior block."""
+    prior_args = deepcopy(prior_block)
+
+    if "prior_source_file" in prior_args:
+        if (
+            "prior_std" in prior_args
+            or "prior_covariance" in prior_args
+            or "central_value" in prior_args
+        ):
+            raise ValueError(
+                "Prior block with 'prior_source_file' cannot also define "
+                "'prior_std', 'prior_covariance', or 'central_value'."
+            )
+
+        source_file = Path(prior_args.pop("prior_source_file"))
+        source_central_attr = prior_args.pop(
+            "prior_source_central_attr", "PARAMS_BEST"
+        )
+        source_cov_attr = prior_args.pop("prior_source_cov_attr", "COV")
+        source_file = _resolve_data_set_file(data_set_path, source_file)
+
+        source_module = _load_python_module_from_file(source_file)
+        if not hasattr(source_module, source_central_attr):
+            raise AttributeError(
+                f"Prior source {source_file} has no attribute '{source_central_attr}'."
+            )
+        if not hasattr(source_module, source_cov_attr):
+            raise AttributeError(
+                f"Prior source {source_file} has no attribute '{source_cov_attr}'."
+            )
+
+        prior_args["central_value"] = jnp.atleast_1d(
+            np.asarray(getattr(source_module, source_central_attr), dtype=float)
+        )
+        prior_args["prior_covariance"] = jnp.atleast_2d(
+            np.asarray(getattr(source_module, source_cov_attr), dtype=float)
+        )
+
+    if "prior_std" in prior_args:
+        prior_args["prior_covariance"] = float(prior_args["prior_std"]) ** 2
+        del prior_args["prior_std"]
+
+    if "prior_covariance" not in prior_args:
+        raise ValueError(
+            "Prior block for parameters "
+            f"{prior_args.get('par_names')} is missing covariance information."
+        )
+
+    prior_covariance = prior_args["prior_covariance"]
+    if isinstance(prior_covariance, str):
+        prior_covariance = candl.io.read_file_from_path(
+            str(_resolve_data_set_file(data_set_path, prior_covariance))
+        )
+    elif np.ndim(prior_covariance) == 0:
+        # avoid trouble parsing values with scientific 'e' notation
+        prior_covariance = float(prior_covariance)
+    else:
+        prior_covariance = jnp.array(prior_covariance)
+
+    prior_args["prior_covariance"] = prior_covariance
+    return prior_args
 
 # --------------------------------------#
 # LIKELIHOOD
@@ -1088,26 +1181,9 @@ class Like:
         priors = []
         if "priors" in self.data_set_dict:
             for prior_block in self.data_set_dict["priors"]:
-                prior_args = prior_block
-
-                if "prior_std" in prior_args:
-                    prior_args["prior_covariance"] = float(prior_args["prior_std"]) ** 2
-                    del prior_args["prior_std"]
-
-                # Check if covariance file is passed rather than numerical value
-                if isinstance(prior_args["prior_covariance"], str):
-                    prior_args["prior_covariance"] = jnp.array(
-                        np.loadtxt(
-                            self.data_set_dict["data_set_path"]
-                            + prior_args["prior_covariance"]
-                        )
-                    )
-                else:
-                    # avoid trouble parsing values with scientific 'e' notation
-                    prior_args["prior_covariance"] = float(
-                        prior_args["prior_covariance"]
-                    )
-
+                prior_args = _prepare_prior_args(
+                    prior_block, self.data_set_dict["data_set_path"]
+                )
                 priors.append(GaussianPrior(**prior_args))
 
         return priors
@@ -2111,25 +2187,9 @@ class LensLike:
         priors = []
         if "priors" in self.data_set_dict:
             for prior_block in self.data_set_dict["priors"]:
-                prior_args = prior_block
-                if "prior_std" in prior_args:
-                    prior_args["prior_covariance"] = float(prior_args["prior_std"]) ** 2
-                    del prior_args["prior_std"]
-
-                # Check if covariance file is passed rather than numerical value
-                if isinstance(prior_args["prior_covariance"], str):
-                    prior_args["prior_covariance"] = jnp.array(
-                        np.loadtxt(
-                            self.data_set_dict["data_set_path"]
-                            + prior_args["prior_covariance"]
-                        )
-                    )
-                else:
-                    # avoid trouble parsing values with scientific 'e' notation
-                    prior_args["prior_covariance"] = float(
-                        prior_args["prior_covariance"]
-                    )
-
+                prior_args = _prepare_prior_args(
+                    prior_block, self.data_set_dict["data_set_path"]
+                )
                 priors.append(GaussianPrior(**prior_args))
 
         return priors
